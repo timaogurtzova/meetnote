@@ -1,0 +1,8 @@
+.env
+.idea/
+docs/DEFENSE.md
+bin/
+coverage.out
+data/
+*.log
+.DS_Store
