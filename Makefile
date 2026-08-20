@@ -5,7 +5,7 @@ BUILD_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 LDFLAGS := -X main.buildVersion=$(BUILD_VERSION) -X main.buildDate=$(BUILD_DATE) -X main.buildCommit=$(BUILD_COMMIT)
 TEST_DATABASE_URL ?= postgres://meetnote:meetnote@localhost:55432/meetnote?sslmode=disable
 
-.PHONY: build test test-race vet check db-up integration bot worker up down logs
+.PHONY: build test test-race vet lint check db-up integration bot worker up down logs
 
 build:
 	mkdir -p bin
@@ -20,7 +20,10 @@ test-race:
 vet:
 	go vet ./...
 
-check: vet test-race
+lint:
+	go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+
+check: vet lint test-race
 
 db-up:
 	docker compose up -d --wait postgres
