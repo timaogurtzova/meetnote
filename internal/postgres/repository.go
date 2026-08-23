@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"iter"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -452,24 +453,29 @@ func (r *Repository) RetryMeeting(ctx context.Context, userID, requestKey string
 	return nil
 }
 
-func (r *Repository) ListStoredPaths(ctx context.Context) ([]string, error) {
-	rows, err := r.pool.Query(ctx, `SELECT stored_path FROM meetings`)
-	if err != nil {
-		return nil, fmt.Errorf("query stored upload paths: %w", err)
-	}
-	defer rows.Close()
-	var paths []string
-	for rows.Next() {
-		var path string
-		if err := rows.Scan(&path); err != nil {
-			return nil, fmt.Errorf("scan stored upload path: %w", err)
+func (r *Repository) ListStoredPaths(ctx context.Context) iter.Seq2[string, error] {
+	return func(yield func(string, error) bool) {
+		rows, err := r.pool.Query(ctx, `SELECT stored_path FROM meetings`)
+		if err != nil {
+			yield("", fmt.Errorf("query stored upload paths: %w", err))
+			return
 		}
-		paths = append(paths, path)
+		defer rows.Close()
+
+		for rows.Next() {
+			var path string
+			if err := rows.Scan(&path); err != nil {
+				yield("", fmt.Errorf("scan stored upload path: %w", err))
+				return
+			}
+			if !yield(path, nil) {
+				return
+			}
+		}
+		if err := rows.Err(); err != nil {
+			yield("", fmt.Errorf("iterate stored upload paths: %w", err))
+		}
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate stored upload paths: %w", err)
-	}
-	return paths, nil
 }
 
 type rowScanner interface {

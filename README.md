@@ -143,7 +143,7 @@ flowchart LR
 - internal/app — пользовательские use cases и outbound-интерфейсы;
 - internal/domain — сущности, статусы и доменные ошибки;
 - internal/postgres — repository, очередь и migration runner;
-- internal/storage — потоковое локальное файловое хранилище;
+- internal/storage — потоковое локальное файловое хранилище с изоляцией через os.Root;
 - internal/clients/mock — автономные Speech/LLM реализации;
 - internal/worker — ограниченный pool, lease heartbeat и recovery.
 
@@ -154,7 +154,8 @@ Telegram adapter зависит от интерфейса application use cases.
 - pgx для PostgreSQL и пула соединений;
 - goose для версионирования схемы;
 - caarlos0/env для типизированной загрузки переменных окружения;
-- zerolog для структурированных JSON-логов;
+- стандартный log/slog для структурированных JSON-логов;
+- x/sync/errgroup для совместной отмены и ожидания фоновых процессов;
 - testify для проверок и обязательных условий в тестах.
 
 ## Миграции

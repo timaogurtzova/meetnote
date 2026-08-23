@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/timaogurtzova/meetnote/internal/app"
 	"github.com/timaogurtzova/meetnote/internal/clients/mock"
 	"github.com/timaogurtzova/meetnote/internal/config"
@@ -70,19 +70,18 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 
 	logger := newLogger(stderr, cfg.LogLevel)
-	logger.Info().Ctx(ctx).
-		Str("mode", string(runMode)).
-		Str("build_version", buildVersion).
-		Str("build_date", buildDate).
-		Str("build_commit", buildCommit).
-		Msg("application started")
-	defer func() { logger.Info().Str("mode", string(runMode)).Msg("application stopped") }()
+	logger.InfoContext(ctx, "application started",
+		"mode", runMode,
+		"build_version", buildVersion,
+		"build_date", buildDate,
+		"build_commit", buildCommit)
+	defer logger.Info("application stopped", "mode", runMode)
 
 	connectCtx, cancelConnect := context.WithTimeout(ctx, cfg.Runtime.OperationTimeout)
 	pool, err := postgres.Open(connectCtx, cfg.Database)
 	cancelConnect()
 	if err != nil {
-		logger.Error().Ctx(ctx).Err(err).Msg("database connection failed")
+		logger.ErrorContext(ctx, "database connection failed", "error", err)
 		return err
 	}
 	defer pool.Close()
@@ -92,7 +91,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		err = postgres.Migrate(migrationCtx, pool)
 		cancelMigration()
 		if err != nil {
-			logger.Error().Ctx(ctx).Err(err).Msg("database migration failed")
+			logger.ErrorContext(ctx, "database migration failed", "error", err)
 			return err
 		}
 	}
@@ -163,12 +162,17 @@ func runTelegramBot(
 	cfg config.Config,
 	repository *postgres.Repository,
 	llmClient app.LLMClient,
-	logger zerolog.Logger,
-) error {
+	logger *slog.Logger,
+) (runErr error) {
 	fileStore, err := storage.NewLocal(cfg.Storage.Directory, cfg.Storage.MaxFileSize)
 	if err != nil {
 		return fmt.Errorf("initialize file storage: %w", err)
 	}
+	defer func() {
+		if closeErr := fileStore.Close(); closeErr != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("close file storage: %w", closeErr))
+		}
+	}()
 	service, err := app.NewService(repository, fileStore, llmClient, app.Limits{
 		MaxQuestionRunes:    cfg.Limits.MaxQuestionRunes,
 		MaxSearchQueryRunes: cfg.Limits.MaxSearchQueryRunes,
@@ -239,7 +243,7 @@ func runTelegramBot(
 	return bot.Run(ctx)
 }
 
-func runOrphanCleanup(ctx context.Context, service *app.Service, timeout time.Duration, logger zerolog.Logger) {
+func runOrphanCleanup(ctx context.Context, service *app.Service, timeout time.Duration, logger *slog.Logger) {
 	const (
 		cleanupInterval = time.Hour
 		orphanGrace     = 15 * time.Minute
@@ -249,7 +253,7 @@ func runOrphanCleanup(ctx context.Context, service *app.Service, timeout time.Du
 		_, err := service.CleanupOrphans(cleanupCtx, orphanGrace)
 		cancelCleanup()
 		if err != nil && ctx.Err() == nil {
-			logger.Error().Ctx(ctx).Err(err).Msg("orphan upload cleanup failed")
+			logger.ErrorContext(ctx, "orphan upload cleanup failed", "error", err)
 		}
 	}
 	cleanup()
@@ -315,15 +319,15 @@ func newLLMClient(cfg config.Config) (app.LLMClient, error) {
 	}
 }
 
-func newLogger(output io.Writer, configuredLevel string) zerolog.Logger {
-	level := zerolog.InfoLevel
+func newLogger(output io.Writer, configuredLevel string) *slog.Logger {
+	level := slog.LevelInfo
 	switch configuredLevel {
 	case "debug":
-		level = zerolog.DebugLevel
+		level = slog.LevelDebug
 	case "warn":
-		level = zerolog.WarnLevel
+		level = slog.LevelWarn
 	case "error":
-		level = zerolog.ErrorLevel
+		level = slog.LevelError
 	}
-	return zerolog.New(output).Level(level).With().Timestamp().Logger()
+	return slog.New(slog.NewJSONHandler(output, &slog.HandlerOptions{Level: level}))
 }

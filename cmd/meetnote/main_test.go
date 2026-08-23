@@ -45,12 +45,12 @@ func TestNewLoggerWritesFilteredJSON(t *testing.T) {
 	t.Parallel()
 	var output bytes.Buffer
 	logger := newLogger(&output, "warn")
-	logger.Info().Msg("ignored")
-	logger.Warn().Str("component", "test").Msg("visible")
+	logger.Info("ignored")
+	logger.Warn("visible", "component", "test")
 
 	var event map[string]any
 	require.NoError(t, json.Unmarshal(bytes.TrimSpace(output.Bytes()), &event))
-	assert.Equal(t, "warn", event["level"])
+	assert.Equal(t, "WARN", event["level"])
 	assert.Equal(t, "test", event["component"])
-	assert.Equal(t, "visible", event["message"])
+	assert.Equal(t, "visible", event["msg"])
 }

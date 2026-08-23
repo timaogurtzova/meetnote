@@ -4,6 +4,7 @@ package app
 import (
 	"context"
 	"io"
+	"iter"
 	"time"
 
 	"github.com/timaogurtzova/meetnote/internal/domain"
@@ -21,7 +22,7 @@ type Repository interface {
 	GetChatAnswer(ctx context.Context, userID, requestKey string) (string, bool, error)
 	SaveChat(ctx context.Context, userID, requestKey, question, answer string, maxHistory int) (string, error)
 	RetryMeeting(ctx context.Context, userID, requestKey string, meetingID int64, maxPending int) error
-	ListStoredPaths(ctx context.Context) ([]string, error)
+	ListStoredPaths(ctx context.Context) iter.Seq2[string, error]
 }
 
 // TaskRepository описывает хранилище задач фоновой обработки.

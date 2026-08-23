@@ -3,11 +3,11 @@ package telegram_test
 import (
 	"context"
 	"io"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/timaogurtzova/meetnote/internal/inbox"
@@ -35,7 +35,7 @@ func TestBotAdvancesOffsetAndStopsOnCancellation(t *testing.T) {
 			UpdateMaxAttempts:  3,
 			UpdateRetention:    7 * 24 * time.Hour,
 		},
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 	)
 	require.NoError(t, err)
 

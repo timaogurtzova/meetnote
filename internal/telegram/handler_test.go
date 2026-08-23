@@ -3,12 +3,12 @@ package telegram_test
 import (
 	"context"
 	"io"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/timaogurtzova/meetnote/internal/domain"
@@ -185,7 +185,7 @@ func TestHandlerReportsConfiguredFileLimit(t *testing.T) {
 			InlineTranscriptRunes: 12_000,
 			MaxResponseParts:      8,
 		},
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -314,7 +314,7 @@ func newTestHandler(t *testing.T, application telegram.Application, api telegram
 			InlineTranscriptRunes: 12_000,
 			MaxResponseParts:      8,
 		},
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 	)
 	if err != nil {
 		t.Fatal(err)

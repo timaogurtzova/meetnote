@@ -19,6 +19,7 @@ func TestLocalSaveAndRemove(t *testing.T) {
 	t.Parallel()
 	store, err := storage.NewLocal(t.TempDir(), 1024)
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	stored, err := store.Save(context.Background(), "alice", "meeting.txt", strings.NewReader("meeting text"), 12)
 	require.NoError(t, err)
 	content, err := os.ReadFile(stored.Path)
@@ -34,6 +35,7 @@ func TestLocalRemoveOrphansKeepsReferencedAndRecentFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	keep, err := store.Save(context.Background(), "alice", "keep.txt", strings.NewReader("keep"), 4)
 	if err != nil {
 		t.Fatal(err)
@@ -72,6 +74,25 @@ func TestLocalRemoveOrphansKeepsReferencedAndRecentFiles(t *testing.T) {
 	}
 }
 
+func TestLocalRemoveDoesNotFollowSymlinkOutsideStorage(t *testing.T) {
+	t.Parallel()
+	storageDirectory := t.TempDir()
+	outsideDirectory := t.TempDir()
+	outsidePath := filepath.Join(outsideDirectory, "private.txt")
+	require.NoError(t, os.WriteFile(outsidePath, []byte("private"), 0o600))
+	require.NoError(t, os.Symlink(outsideDirectory, filepath.Join(storageDirectory, "outside")))
+
+	store, err := storage.NewLocal(storageDirectory, 1024)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	err = store.Remove(context.Background(), filepath.Join(storageDirectory, "outside", "private.txt"))
+	require.Error(t, err)
+	content, err := os.ReadFile(outsidePath)
+	require.NoError(t, err)
+	assert.Equal(t, "private", string(content))
+}
+
 func TestLocalRejectsUnsupportedAndLargeFiles(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
@@ -79,6 +100,7 @@ func TestLocalRejectsUnsupportedAndLargeFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	if _, err := store.Save(context.Background(), "alice", "meeting.exe", strings.NewReader("x"), 1); !errors.Is(err, domain.ErrUnsupportedFormat) {
 		t.Fatalf("Save() error = %v, want unsupported format", err)
 	}
@@ -94,6 +116,7 @@ func TestLocalEnforcesActualStreamSizeAndSanitizesFilename(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	if _, err := store.Save(
 		context.Background(),
 		"alice",
@@ -124,6 +147,7 @@ func TestLocalRejectsUnsafeOriginalFilename(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	for _, filename := range []string{strings.Repeat("а", 256) + ".txt", "line\nbreak.txt"} {
 		if _, err := store.Save(context.Background(), "alice", filename, strings.NewReader("notes"), 5); !errors.Is(err, domain.ErrInvalidInput) {
 			t.Errorf("Save(%q) error = %v, want invalid input", filename, err)

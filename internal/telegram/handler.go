@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -12,7 +13,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/rs/zerolog"
 	"github.com/timaogurtzova/meetnote/internal/domain"
 )
 
@@ -41,16 +41,16 @@ type Handler struct {
 	application Application
 	api         API
 	config      HandlerConfig
-	logger      zerolog.Logger
+	logger      *slog.Logger
 }
 
 func NewHandler(
 	application Application,
 	api API,
 	config HandlerConfig,
-	logger zerolog.Logger,
+	logger *slog.Logger,
 ) (*Handler, error) {
-	if application == nil || api == nil {
+	if application == nil || api == nil || logger == nil {
 		return nil, errors.New("telegram handler dependencies must not be nil")
 	}
 	if config.RequestTimeout <= 0 || config.DownloadTimeout <= 0 || config.MaxFileSize <= 0 ||
@@ -193,8 +193,7 @@ func (h *Handler) replyError(ctx context.Context, chatID, updateID int64, operat
 	if isExpectedUserError(operationErr) {
 		return sendErr
 	}
-	h.logger.Error().Ctx(ctx).Int64("update_id", updateID).Err(operationErr).
-		Msg("telegram business operation failed")
+	h.logger.ErrorContext(ctx, "telegram business operation failed", "update_id", updateID, "error", operationErr)
 	return sendErr
 }
 

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,7 +27,9 @@ var supportedExtensions = map[string]struct{}{
 const maxFilenameRunes = 255
 
 type Local struct {
-	root    string
+	rootPath string
+	// os.Root проверяет каждый компонент пути и запрещает переход по символической ссылке за пределы каталога.
+	root    *os.Root
 	maxSize int64
 }
 
@@ -41,7 +44,18 @@ func NewLocal(root string, maxSize int64) (*Local, error) {
 	if err := os.MkdirAll(absoluteRoot, 0o750); err != nil {
 		return nil, fmt.Errorf("create storage directory: %w", err)
 	}
-	return &Local{root: absoluteRoot, maxSize: maxSize}, nil
+	rootHandle, err := os.OpenRoot(absoluteRoot)
+	if err != nil {
+		return nil, fmt.Errorf("open storage directory: %w", err)
+	}
+	return &Local{rootPath: absoluteRoot, root: rootHandle, maxSize: maxSize}, nil
+}
+
+func (s *Local) Close() error {
+	if err := s.root.Close(); err != nil {
+		return fmt.Errorf("close storage directory: %w", err)
+	}
+	return nil
 }
 
 func (s *Local) Save(
@@ -74,16 +88,16 @@ func (s *Local) Save(
 	}
 
 	userHash := sha256.Sum256([]byte(userID))
-	userDirectory := filepath.Join(s.root, hex.EncodeToString(userHash[:8]))
-	if err := os.MkdirAll(userDirectory, 0o750); err != nil {
+	userDirectory := hex.EncodeToString(userHash[:8])
+	if err := s.root.MkdirAll(userDirectory, 0o750); err != nil {
 		return domain.StoredFile{}, fmt.Errorf("create user storage: %w", err)
 	}
 	name, err := randomName(extension)
 	if err != nil {
 		return domain.StoredFile{}, err
 	}
-	destinationPath := filepath.Join(userDirectory, name)
-	destination, err := os.OpenFile(destinationPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	relativePath := filepath.Join(userDirectory, name)
+	destination, err := s.root.OpenFile(relativePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return domain.StoredFile{}, fmt.Errorf("create stored upload: %w", err)
 	}
@@ -91,11 +105,11 @@ func (s *Local) Save(
 	copied, copyErr := copyWithContext(ctx, destination, source, s.maxSize)
 	closeErr := destination.Close()
 	if copyErr != nil || closeErr != nil {
-		_ = os.Remove(destinationPath)
+		_ = s.root.Remove(relativePath)
 		return domain.StoredFile{}, errors.Join(copyErr, closeErr)
 	}
 
-	return domain.StoredFile{OriginalFilename: filename, Path: destinationPath, Size: copied}, nil
+	return domain.StoredFile{OriginalFilename: filename, Path: filepath.Join(s.rootPath, relativePath), Size: copied}, nil
 }
 
 func (s *Local) Remove(ctx context.Context, path string) error {
@@ -106,11 +120,11 @@ func (s *Local) Remove(ctx context.Context, path string) error {
 	if err != nil {
 		return fmt.Errorf("resolve stored path: %w", err)
 	}
-	relative, err := filepath.Rel(s.root, absolutePath)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return errors.New("refusing to remove a path outside storage")
+	relativePath, err := filepath.Rel(s.rootPath, absolutePath)
+	if err != nil {
+		return fmt.Errorf("resolve stored path relative to storage: %w", err)
 	}
-	if err := os.Remove(absolutePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := s.root.Remove(relativePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove stored upload: %w", err)
 	}
 	return nil
@@ -125,7 +139,7 @@ func (s *Local) RemoveOrphans(
 		return 0, fmt.Errorf("%w: keep set and cutoff time are required", domain.ErrInvalidInput)
 	}
 	removed := 0
-	err := filepath.WalkDir(s.root, func(path string, entry os.DirEntry, walkErr error) error {
+	err := fs.WalkDir(s.root.FS(), ".", func(relativePath string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -135,7 +149,8 @@ func (s *Local) RemoveOrphans(
 		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
 			return nil
 		}
-		if _, referenced := keep[path]; referenced {
+		absolutePath := filepath.Join(s.rootPath, filepath.FromSlash(relativePath))
+		if _, referenced := keep[absolutePath]; referenced {
 			return nil
 		}
 		info, err := entry.Info()
@@ -145,7 +160,7 @@ func (s *Local) RemoveOrphans(
 		if !info.Mode().IsRegular() || !info.ModTime().Before(olderThan) {
 			return nil
 		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := s.root.Remove(filepath.FromSlash(relativePath)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		removed++

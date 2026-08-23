@@ -7,14 +7,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
-	"github.com/rs/zerolog"
 	"github.com/timaogurtzova/meetnote/internal/app"
 	"github.com/timaogurtzova/meetnote/internal/domain"
+	"golang.org/x/sync/errgroup"
 )
 
 const failureSaveTimeout = 5 * time.Second
@@ -36,7 +36,7 @@ type Pool struct {
 	speech     app.SpeechClient
 	llm        app.LLMClient
 	config     Config
-	logger     zerolog.Logger
+	logger     *slog.Logger
 	instanceID string
 }
 
@@ -45,9 +45,9 @@ func NewPool(
 	speech app.SpeechClient,
 	llm app.LLMClient,
 	config Config,
-	logger zerolog.Logger,
+	logger *slog.Logger,
 ) (*Pool, error) {
-	if repository == nil || speech == nil || llm == nil {
+	if repository == nil || speech == nil || llm == nil || logger == nil {
 		return nil, errors.New("worker dependencies must not be nil")
 	}
 	if config.Count < 1 || config.PollInterval <= 0 || config.SpeechTimeout <= 0 || config.LLMTimeout <= 0 ||
@@ -75,44 +75,29 @@ func (p *Pool) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("recover interrupted tasks: %w", err)
 	}
-	p.logger.Info().Ctx(ctx).
-		Int("workers", p.config.Count).
-		Str("instance_id", p.instanceID).
-		Int64("recovered_tasks", recovered).
-		Msg("worker pool started")
+	p.logger.InfoContext(ctx, "worker pool started",
+		"workers", p.config.Count,
+		"instance_id", p.instanceID,
+		"recovered_tasks", recovered)
 
-	runCtx, cancelRun := context.WithCancel(ctx)
-	defer cancelRun()
-
-	var workers sync.WaitGroup
-	workerErrors := make(chan error, p.config.Count)
-	workers.Add(p.config.Count + 1)
-	go func() {
-		defer workers.Done()
+	group, runCtx := errgroup.WithContext(ctx)
+	group.Go(func() error {
 		p.runRecovery(runCtx)
-	}()
+		return nil
+	})
 	for workerID := 1; workerID <= p.config.Count; workerID++ {
-		go func(id int) {
-			defer workers.Done()
-			workerErrors <- p.runWorker(runCtx, id)
-		}(workerID)
+		workerID := workerID
+		group.Go(func() error {
+			return p.runWorker(runCtx, workerID)
+		})
 	}
-	var runErrors []error
-	for range p.config.Count {
-		workerErr := <-workerErrors
-		if workerErr != nil {
-			runErrors = append(runErrors, workerErr)
-			cancelRun()
-		}
-	}
-	workers.Wait()
-	close(workerErrors)
-	p.logger.Info().Msg("worker pool stopped")
-	return errors.Join(runErrors...)
+	runErr := group.Wait()
+	p.logger.InfoContext(ctx, "worker pool stopped")
+	return runErr
 }
 
 func (p *Pool) runWorker(ctx context.Context, workerID int) error {
-	logger := p.logger.With().Int("worker_id", workerID).Logger()
+	logger := p.logger.With("worker_id", workerID)
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil
@@ -122,7 +107,7 @@ func (p *Pool) runWorker(ctx context.Context, workerID int) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			logger.Error().Ctx(ctx).Err(err).Msg("claim task failed")
+			logger.ErrorContext(ctx, "claim task failed", "error", err)
 			if !waitForPoll(ctx, p.config.PollInterval) {
 				return nil
 			}
@@ -151,20 +136,20 @@ func (p *Pool) runRecovery(ctx context.Context) {
 			recovered, err := p.repository.RecoverInterrupted(ctx)
 			if err != nil {
 				if ctx.Err() == nil {
-					p.logger.Error().Ctx(ctx).Err(err).Msg("recover expired task leases failed")
+					p.logger.ErrorContext(ctx, "recover expired task leases failed", "error", err)
 				}
 				continue
 			}
 			if recovered > 0 {
-				p.logger.Warn().Ctx(ctx).Int64("tasks", recovered).Msg("expired task leases recovered")
+				p.logger.WarnContext(ctx, "expired task leases recovered", "tasks", recovered)
 			}
 		}
 	}
 }
 
-func (p *Pool) process(ctx context.Context, logger zerolog.Logger, task domain.Task) error {
-	logger = logger.With().Int64("task_id", task.ID).Int64("meeting_id", task.MeetingID).Int("attempt", task.Attempt).Logger()
-	logger.Info().Ctx(ctx).Msg("task processing started")
+func (p *Pool) process(ctx context.Context, logger *slog.Logger, task domain.Task) error {
+	logger = logger.With("task_id", task.ID, "meeting_id", task.MeetingID, "attempt", task.Attempt)
+	logger.InfoContext(ctx, "task processing started")
 
 	taskCtx, cancelTask := context.WithCancel(ctx)
 	heartbeatResult := make(chan error, 1)
@@ -177,18 +162,18 @@ func (p *Pool) process(ctx context.Context, logger zerolog.Logger, task domain.T
 	heartbeatErr := <-heartbeatResult
 	if heartbeatErr != nil {
 		if errors.Is(heartbeatErr, domain.ErrLeaseLost) {
-			logger.Warn().Msg("task lease lost; processing result discarded")
+			logger.WarnContext(ctx, "task lease lost; processing result discarded")
 			return processErr
 		}
-		logger.Error().Err(heartbeatErr).Msg("task lease heartbeat failed")
+		logger.ErrorContext(ctx, "task lease heartbeat failed", "error", heartbeatErr)
 		return errors.Join(processErr, fmt.Errorf("task %d lease heartbeat: %w", task.ID, heartbeatErr))
 	}
 	return processErr
 }
 
-func (p *Pool) processStages(ctx context.Context, logger zerolog.Logger, task domain.Task) error {
+func (p *Pool) processStages(ctx context.Context, logger *slog.Logger, task domain.Task) error {
 	speechCtx, cancelSpeech := context.WithTimeout(ctx, p.config.SpeechTimeout)
-	logger.Info().Ctx(ctx).Msg("speech client request started")
+	logger.InfoContext(ctx, "speech client request started")
 	transcript, err := p.speech.Transcribe(speechCtx, task.StoredPath)
 	cancelSpeech()
 	if err != nil {
@@ -201,10 +186,10 @@ func (p *Pool) processStages(ctx context.Context, logger zerolog.Logger, task do
 	if err := p.repository.SaveTranscription(ctx, task, transcript); err != nil {
 		return p.saveTaskFailure(logger, task, "save transcription", err)
 	}
-	logger.Info().Ctx(ctx).Str("status", string(domain.StatusTranscribed)).Msg("task status changed")
+	logger.InfoContext(ctx, "task status changed", "status", domain.StatusTranscribed)
 
 	llmCtx, cancelLLM := context.WithTimeout(ctx, p.config.LLMTimeout)
-	logger.Info().Ctx(ctx).Msg("LLM summary request started")
+	logger.InfoContext(ctx, "LLM summary request started")
 	summary, err := p.llm.Summarize(llmCtx, transcript)
 	cancelLLM()
 	if err != nil {
@@ -217,12 +202,12 @@ func (p *Pool) processStages(ctx context.Context, logger zerolog.Logger, task do
 	if err := p.repository.SaveSummary(ctx, task, summary); err != nil {
 		return p.saveTaskFailure(logger, task, "save summary", err)
 	}
-	logger.Info().Ctx(ctx).Str("status", string(domain.StatusSummarized)).Msg("task status changed")
+	logger.InfoContext(ctx, "task status changed", "status", domain.StatusSummarized)
 
 	if err := p.repository.CompleteTask(ctx, task); err != nil {
 		return p.saveTaskFailure(logger, task, "complete task", err)
 	}
-	logger.Info().Ctx(ctx).Str("status", string(domain.StatusCompleted)).Msg("task processing completed")
+	logger.InfoContext(ctx, "task processing completed", "status", domain.StatusCompleted)
 	return nil
 }
 
@@ -249,20 +234,20 @@ func (p *Pool) keepLease(
 	}
 }
 
-func (p *Pool) saveTaskFailure(logger zerolog.Logger, task domain.Task, stage string, processErr error) error {
+func (p *Pool) saveTaskFailure(logger *slog.Logger, task domain.Task, stage string, processErr error) error {
 	failure := processingFailureForUser(stage, processErr)
 	saveCtx, cancel := context.WithTimeout(context.Background(), failureSaveTimeout)
 	defer cancel()
 	if err := p.repository.FailTask(saveCtx, task, failure); err != nil {
 		if errors.Is(err, domain.ErrLeaseLost) {
-			logger.Warn().Str("stage", stage).Msg("task failure ignored because lease was lost")
+			logger.Warn("task failure ignored because lease was lost", "stage", stage)
 			return nil
 		}
-		logger.Error().Str("stage", stage).Err(processErr).AnErr("persistence_error", err).
-			Msg("task failure could not be persisted")
+		logger.Error("task failure could not be persisted",
+			"stage", stage, "error", processErr, "persistence_error", err)
 		return fmt.Errorf("persist failure for task %d after %s: %w", task.ID, stage, err)
 	}
-	logger.Error().Str("stage", stage).Err(processErr).Str("status", string(domain.StatusFailed)).Msg("task processing failed")
+	logger.Error("task processing failed", "stage", stage, "error", processErr, "status", domain.StatusFailed)
 	return nil
 }
 

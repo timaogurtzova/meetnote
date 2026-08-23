@@ -7,12 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
+	"log/slog"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/timaogurtzova/meetnote/internal/domain"
 	updateinbox "github.com/timaogurtzova/meetnote/internal/inbox"
+	"golang.org/x/sync/errgroup"
 )
 
 type BotConfig struct {
@@ -32,12 +32,12 @@ type Bot struct {
 	handler    *Handler
 	inbox      updateinbox.Repository
 	config     BotConfig
-	logger     zerolog.Logger
+	logger     *slog.Logger
 	instanceID string
 }
 
-func NewBot(api API, handler *Handler, inbox updateinbox.Repository, config BotConfig, logger zerolog.Logger) (*Bot, error) {
-	if api == nil || handler == nil || inbox == nil {
+func NewBot(api API, handler *Handler, inbox updateinbox.Repository, config BotConfig, logger *slog.Logger) (*Bot, error) {
+	if api == nil || handler == nil || inbox == nil || logger == nil {
 		return nil, errors.New("telegram bot dependencies must not be nil")
 	}
 	if config.PollTimeout <= 0 || config.RequestTimeout <= 0 || config.PersistenceTimeout <= 0 ||
@@ -67,58 +67,27 @@ func (b *Bot) Run(ctx context.Context) error {
 	err = b.api.SetCommands(commandsCtx, supportedCommands())
 	cancelCommands()
 	if err != nil {
-		b.logger.Warn().Ctx(ctx).Err(err).Msg("telegram command menu setup failed")
+		b.logger.WarnContext(ctx, "telegram command menu setup failed", "error", err)
 	}
 
 	recovered, err := b.inbox.RecoverExpired(ctx)
 	if err != nil {
 		return fmt.Errorf("recover Telegram inbox: %w", err)
 	}
-	b.logger.Info().Ctx(ctx).
-		Int("update_workers", b.config.UpdateWorkers).
-		Str("instance_id", b.instanceID).
-		Int64("recovered_updates", recovered).
-		Msg("telegram bot started")
-	defer func() { b.logger.Info().Msg("telegram bot stopped") }()
+	b.logger.InfoContext(ctx, "telegram bot started",
+		"update_workers", b.config.UpdateWorkers,
+		"instance_id", b.instanceID,
+		"recovered_updates", recovered)
+	defer b.logger.Info("telegram bot stopped")
 
-	runCtx, cancelRun := context.WithCancel(ctx)
-	defer cancelRun()
-	processes := b.config.UpdateWorkers + 2
-	results := make(chan error, processes)
-	var group sync.WaitGroup
-	group.Add(processes)
-	go func() {
-		defer group.Done()
-		results <- b.poll(runCtx)
-	}()
-	go func() {
-		defer group.Done()
-		results <- b.recover(runCtx)
-	}()
+	group, runCtx := errgroup.WithContext(ctx)
+	group.Go(func() error { return b.poll(runCtx) })
+	group.Go(func() error { return b.recover(runCtx) })
 	for worker := 1; worker <= b.config.UpdateWorkers; worker++ {
-		go func(workerID int) {
-			defer group.Done()
-			results <- b.processUpdates(runCtx, workerID)
-		}(worker)
+		worker := worker
+		group.Go(func() error { return b.processUpdates(runCtx, worker) })
 	}
-
-	var runErrors []error
-	select {
-	case <-ctx.Done():
-	case processErr := <-results:
-		if processErr != nil {
-			runErrors = append(runErrors, processErr)
-		}
-	}
-	cancelRun()
-	group.Wait()
-	close(results)
-	for processErr := range results {
-		if processErr != nil {
-			runErrors = append(runErrors, processErr)
-		}
-	}
-	return errors.Join(runErrors...)
+	return group.Wait()
 }
 
 func (b *Bot) poll(ctx context.Context) error {
@@ -139,7 +108,7 @@ func (b *Bot) poll(ctx context.Context) error {
 				return nil
 			}
 			delay := retryDelayFor(pollErr, retryDelay, b.config.RetryMax)
-			b.logger.Error().Ctx(ctx).Err(pollErr).Dur("retry_in", delay).Msg("telegram polling failed")
+			b.logger.ErrorContext(ctx, "telegram polling failed", "error", pollErr, "retry_in", delay)
 			if !wait(ctx, delay) {
 				return nil
 			}
@@ -170,7 +139,7 @@ func (b *Bot) poll(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			b.logger.Error().Ctx(ctx).Int("updates", len(items)).Err(err).Msg("persist Telegram updates failed")
+			b.logger.ErrorContext(ctx, "persist Telegram updates failed", "updates", len(items), "error", err)
 			if !wait(ctx, retryDelay) {
 				return nil
 			}
@@ -196,23 +165,23 @@ func (b *Bot) recover(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return nil
 				}
-				b.logger.Error().Ctx(ctx).Err(err).Msg("recover expired Telegram updates failed")
+				b.logger.ErrorContext(ctx, "recover expired Telegram updates failed", "error", err)
 				continue
 			}
 			if recovered > 0 {
-				b.logger.Warn().Ctx(ctx).Int64("updates", recovered).Msg("expired Telegram updates recovered")
+				b.logger.WarnContext(ctx, "expired Telegram updates recovered", "updates", recovered)
 			}
 			if lastPrune.IsZero() || time.Since(lastPrune) >= time.Hour {
 				pruned, err := b.inbox.Prune(ctx, time.Now().Add(-b.config.UpdateRetention))
 				if err != nil {
 					if ctx.Err() == nil {
-						b.logger.Error().Ctx(ctx).Err(err).Msg("prune Telegram inbox failed")
+						b.logger.ErrorContext(ctx, "prune Telegram inbox failed", "error", err)
 					}
 					continue
 				}
 				lastPrune = time.Now()
 				if pruned > 0 {
-					b.logger.Info().Ctx(ctx).Int64("updates", pruned).Msg("Telegram inbox pruned")
+					b.logger.InfoContext(ctx, "Telegram inbox pruned", "updates", pruned)
 				}
 			}
 		}
@@ -221,7 +190,7 @@ func (b *Bot) recover(ctx context.Context) error {
 
 func (b *Bot) processUpdates(ctx context.Context, workerID int) error {
 	workerName := fmt.Sprintf("%s-%d", b.instanceID, workerID)
-	logger := b.logger.With().Int("update_worker", workerID).Logger()
+	logger := b.logger.With("update_worker", workerID)
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -231,7 +200,7 @@ func (b *Bot) processUpdates(ctx context.Context, workerID int) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			logger.Error().Ctx(ctx).Err(err).Msg("claim Telegram update failed")
+			logger.ErrorContext(ctx, "claim Telegram update failed", "error", err)
 			if !wait(ctx, b.config.RetryMin) {
 				return nil
 			}
@@ -264,18 +233,17 @@ func (b *Bot) processUpdates(ctx context.Context, workerID int) error {
 		cancelPersist()
 		if retryErr != nil {
 			if errors.Is(retryErr, domain.ErrLeaseLost) {
-				logger.Warn().Int64("update_id", item.ID).Msg("Telegram update lease lost")
+				logger.WarnContext(ctx, "Telegram update lease lost", "update_id", item.ID)
 				continue
 			}
 			return fmt.Errorf("persist retry for Telegram update %d: %w", item.ID, retryErr)
 		}
-		logger.Error().
-			Int64("update_id", item.ID).
-			Int("attempt", item.Attempt).
-			Bool("terminal", terminal).
-			Dur("retry_in", delay).
-			Err(handleErr).
-			Msg("Telegram update handling failed")
+		logger.ErrorContext(ctx, "Telegram update handling failed",
+			"update_id", item.ID,
+			"attempt", item.Attempt,
+			"terminal", terminal,
+			"retry_in", delay,
+			"error", handleErr)
 	}
 }
 

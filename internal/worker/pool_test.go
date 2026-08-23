@@ -3,12 +3,13 @@ package worker_test
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/timaogurtzova/meetnote/internal/domain"
@@ -17,87 +18,67 @@ import (
 
 func TestPoolLimitsParallelismAndCompletesTasks(t *testing.T) {
 	t.Parallel()
-	const taskCount = 6
-	repository := newFakeTaskRepository(taskCount)
-	speech := &trackingSpeech{delay: 30 * time.Millisecond}
-	pool := newTestPool(t, repository, speech, &stubLLM{}, 2)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- pool.Run(ctx) }()
+	synctest.Test(t, func(t *testing.T) {
+		const taskCount = 6
+		repository := newFakeTaskRepository(taskCount)
+		speech := &trackingSpeech{delay: 30 * time.Millisecond}
+		pool := newTestPool(t, repository, speech, &stubLLM{}, 2)
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- pool.Run(ctx) }()
 
-	for completed := 0; completed < taskCount; completed++ {
-		select {
-		case <-repository.completed:
-		case <-time.After(3 * time.Second):
-			t.Fatal("worker pool did not complete all tasks")
+		for range taskCount {
+			<-repository.completed
 		}
-	}
-	cancel()
-	select {
-	case err := <-done:
+		cancel()
+		err := <-done
 		require.NoError(t, err)
-	case <-time.After(time.Second):
-		t.Fatal("worker pool did not stop")
-	}
-	assert.Equal(t, int32(2), speech.maximum.Load())
-	assert.Zero(t, repository.failedCount())
-	if repository.refreshCount() == 0 {
-		t.Fatal("task leases were not refreshed during processing")
-	}
-	if repository.recoveryCount() < 2 {
-		t.Fatalf("periodic recovery calls = %d, want at least 2", repository.recoveryCount())
-	}
+		assert.Equal(t, int32(2), speech.maximum.Load())
+		assert.Zero(t, repository.failedCount())
+		if repository.refreshCount() == 0 {
+			t.Fatal("task leases were not refreshed during processing")
+		}
+		if repository.recoveryCount() < 2 {
+			t.Fatalf("periodic recovery calls = %d, want at least 2", repository.recoveryCount())
+		}
+	})
 }
 
 func TestPoolReturnsFailurePersistenceError(t *testing.T) {
 	t.Parallel()
-	wantErr := errors.New("database unavailable")
-	repository := newFakeTaskRepository(1)
-	repository.failErr = wantErr
-	pool := newTestPool(t, repository, &failingSpeech{}, &stubLLM{}, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- pool.Run(ctx) }()
+	synctest.Test(t, func(t *testing.T) {
+		wantErr := errors.New("database unavailable")
+		repository := newFakeTaskRepository(1)
+		repository.failErr = wantErr
+		pool := newTestPool(t, repository, &failingSpeech{}, &stubLLM{}, 1)
+		done := make(chan error, 1)
+		go func() { done <- pool.Run(t.Context()) }()
 
-	select {
-	case err := <-done:
+		err := <-done
 		if !errors.Is(err, wantErr) {
 			t.Fatalf("Run() error = %v, want %v", err, wantErr)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("worker pool did not return persistence error")
-	}
+	})
 }
 
 func TestPoolCancellationPersistsFailureAndStops(t *testing.T) {
 	t.Parallel()
-	repository := newFakeTaskRepository(1)
-	speech := &blockingSpeech{}
-	pool := newTestPool(t, repository, speech, &stubLLM{}, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- pool.Run(ctx) }()
+	synctest.Test(t, func(t *testing.T) {
+		repository := newFakeTaskRepository(1)
+		speech := &blockingSpeech{}
+		pool := newTestPool(t, repository, speech, &stubLLM{}, 1)
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- pool.Run(ctx) }()
 
-	select {
-	case <-repository.claimed:
-	case <-time.After(time.Second):
-		t.Fatal("task was not claimed")
-	}
-	cancel()
-	select {
-	case <-repository.failed:
-	case <-time.After(time.Second):
-		t.Fatal("cancelled task was not marked failed")
-	}
-	select {
-	case err := <-done:
+		<-repository.claimed
+		cancel()
+		<-repository.failed
+		err := <-done
 		if err != nil {
 			t.Fatalf("Run() error: %v", err)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("worker pool leaked after cancellation")
-	}
+	})
 }
 
 func TestPoolRejectsEmptySuccessfulProviderResults(t *testing.T) {
@@ -115,32 +96,25 @@ func TestPoolRejectsEmptySuccessfulProviderResults(t *testing.T) {
 	for _, test := range tests {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			repository := newFakeTaskRepository(1)
-			pool := newTestPool(t, repository, test.speech, test.llm, 1)
-			ctx, cancel := context.WithCancel(context.Background())
-			done := make(chan error, 1)
-			go func() { done <- pool.Run(ctx) }()
-			select {
-			case <-repository.failed:
-			case <-time.After(time.Second):
-				t.Fatal("worker did not persist invalid provider result")
-			}
-			cancel()
-			select {
-			case err := <-done:
+			synctest.Test(t, func(t *testing.T) {
+				repository := newFakeTaskRepository(1)
+				pool := newTestPool(t, repository, test.speech, test.llm, 1)
+				ctx, cancel := context.WithCancel(t.Context())
+				done := make(chan error, 1)
+				go func() { done <- pool.Run(ctx) }()
+				<-repository.failed
+				cancel()
+				err := <-done
 				if err != nil {
 					t.Fatalf("Run() error: %v", err)
 				}
-			case <-time.After(time.Second):
-				t.Fatal("worker did not stop after cancellation")
-			}
-			repository.mu.Lock()
-			failure := repository.failure
-			repository.mu.Unlock()
-			if failure.Code != "invalid_provider_response" || failure.Message == "" {
-				t.Fatalf("persisted failure = %#v", failure)
-			}
+				repository.mu.Lock()
+				failure := repository.failure
+				repository.mu.Unlock()
+				if failure.Code != "invalid_provider_response" || failure.Message == "" {
+					t.Fatalf("persisted failure = %#v", failure)
+				}
+			})
 		})
 	}
 }
@@ -164,7 +138,7 @@ func newTestPool(t *testing.T, repository *fakeTaskRepository, speech interface 
 			MaxTranscriptRunes: 500_000,
 			MaxSummaryRunes:    12_000,
 		},
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 	)
 	if err != nil {
 		t.Fatal(err)

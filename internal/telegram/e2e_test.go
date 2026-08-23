@@ -3,13 +3,13 @@ package telegram_test
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/timaogurtzova/meetnote/internal/app"
@@ -36,6 +36,7 @@ func TestTelegramFullBusinessScenario(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { require.NoError(t, fileStore.Close()) })
 	llm := mock.NewLLM(time.Millisecond)
 	service, err := app.NewService(
 		repository,
@@ -45,7 +46,7 @@ func TestTelegramFullBusinessScenario(t *testing.T) {
 			MaxQuestionRunes: 2000, MaxSearchQueryRunes: 500, MaxAnswerRunes: 8000, MaxChatHistory: 1000,
 			MeetingQuota: domain.MeetingQuota{MaxMeetings: 100, MaxPending: 10, MaxStorageBytes: 200 * 1024 * 1024},
 		},
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -87,7 +88,7 @@ func TestTelegramFullBusinessScenario(t *testing.T) {
 			MaxTranscriptRunes: 500_000,
 			MaxSummaryRunes:    12_000,
 		},
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 	)
 	if err != nil {
 		t.Fatal(err)

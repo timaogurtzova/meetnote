@@ -7,11 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"time"
 	"unicode/utf8"
 
-	"github.com/rs/zerolog"
 	"github.com/timaogurtzova/meetnote/internal/domain"
 )
 
@@ -37,11 +37,11 @@ type Service struct {
 	files      FileStore
 	llm        LLMClient
 	limits     Limits
-	logger     zerolog.Logger
+	logger     *slog.Logger
 }
 
-func NewService(repository Repository, files FileStore, llm LLMClient, limits Limits, logger zerolog.Logger) (*Service, error) {
-	if repository == nil || files == nil || llm == nil {
+func NewService(repository Repository, files FileStore, llm LLMClient, limits Limits, logger *slog.Logger) (*Service, error) {
+	if repository == nil || files == nil || llm == nil || logger == nil {
 		return nil, errors.New("application dependencies must not be nil")
 	}
 	if limits.MaxQuestionRunes < 1 || limits.MaxSearchQueryRunes < 1 ||
@@ -63,7 +63,7 @@ func (s *Service) Start(ctx context.Context, userID string) error {
 	if err := s.repository.RegisterUser(ctx, userID); err != nil {
 		return fmt.Errorf("register user: %w", err)
 	}
-	s.logger.Info().Ctx(ctx).Str("user_ref", safeUserRef(userID)).Msg("user registered")
+	s.logger.InfoContext(ctx, "user registered", "user_ref", safeUserRef(userID))
 	return nil
 }
 
@@ -100,20 +100,19 @@ func (s *Service) Load(
 		// Результат COMMIT может быть неоднозначным: PostgreSQL уже сохранил встречу,
 		// хотя клиент получил сетевую ошибку. Файл остается до плановой сверки с базой,
 		// чтобы не удалить данные созданной встречи.
-		s.logger.Error().Ctx(ctx).Str("user_ref", safeUserRef(userID)).Err(err).
-			Msg("meeting creation outcome is uncertain; upload retained for reconciliation")
+		s.logger.ErrorContext(ctx, "meeting creation outcome is uncertain; upload retained for reconciliation",
+			"user_ref", safeUserRef(userID), "error", err)
 		return domain.Meeting{}, fmt.Errorf("create meeting: %w", err)
 	}
 	if !created {
 		s.removeUpload(ctx, file.Path, "duplicate upload cleanup failed", meeting.ID)
-		s.logger.Info().Ctx(ctx).Int64("meeting_id", meeting.ID).Msg("duplicate meeting request reused")
+		s.logger.InfoContext(ctx, "duplicate meeting request reused", "meeting_id", meeting.ID)
 		return meeting, nil
 	}
-	s.logger.Info().Ctx(ctx).
-		Str("user_ref", safeUserRef(userID)).
-		Int64("meeting_id", meeting.ID).
-		Int64("file_size", file.Size).
-		Msg("meeting and task created")
+	s.logger.InfoContext(ctx, "meeting and task created",
+		"user_ref", safeUserRef(userID),
+		"meeting_id", meeting.ID,
+		"file_size", file.Size)
 	return meeting, nil
 }
 
@@ -212,7 +211,7 @@ func (s *Service) Chat(ctx context.Context, userID, question, requestKey string)
 	if err != nil {
 		return "", fmt.Errorf("save chat history: %w", err)
 	}
-	s.logger.Info().Ctx(ctx).Str("user_ref", safeUserRef(userID)).Int("documents", len(documents)).Msg("chat answered")
+	s.logger.InfoContext(ctx, "chat answered", "user_ref", safeUserRef(userID), "documents", len(documents))
 	return answer, nil
 }
 
@@ -231,7 +230,7 @@ func (s *Service) Retry(ctx context.Context, userID, requestKey string, meetingI
 	if err := s.repository.RetryMeeting(ctx, userID, requestKey, meetingID, s.limits.MeetingQuota.MaxPending); err != nil {
 		return fmt.Errorf("retry meeting: %w", err)
 	}
-	s.logger.Info().Ctx(ctx).Str("user_ref", safeUserRef(userID)).Int64("meeting_id", meetingID).Msg("meeting queued for retry")
+	s.logger.InfoContext(ctx, "meeting queued for retry", "user_ref", safeUserRef(userID), "meeting_id", meetingID)
 	return nil
 }
 
@@ -239,11 +238,11 @@ func (s *Service) removeUpload(ctx context.Context, path, failureMessage string,
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	defer cancelCleanup()
 	if err := s.files.Remove(cleanupCtx, path); err != nil {
-		event := s.logger.Error().Ctx(ctx).Err(err)
+		attributes := []any{"error", err}
 		if meetingID > 0 {
-			event.Int64("meeting_id", meetingID)
+			attributes = append(attributes, "meeting_id", meetingID)
 		}
-		event.Msg(failureMessage)
+		s.logger.ErrorContext(ctx, failureMessage, attributes...)
 	}
 }
 
@@ -253,12 +252,11 @@ func (s *Service) CleanupOrphans(ctx context.Context, gracePeriod time.Duration)
 	if gracePeriod <= 0 {
 		return 0, fmt.Errorf("%w: orphan grace period must be positive", domain.ErrInvalidInput)
 	}
-	paths, err := s.repository.ListStoredPaths(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("list referenced uploads: %w", err)
-	}
-	keep := make(map[string]struct{}, len(paths))
-	for _, path := range paths {
+	keep := make(map[string]struct{})
+	for path, pathErr := range s.repository.ListStoredPaths(ctx) {
+		if pathErr != nil {
+			return 0, fmt.Errorf("list referenced uploads: %w", pathErr)
+		}
 		keep[path] = struct{}{}
 	}
 	removed, err := s.files.RemoveOrphans(ctx, keep, time.Now().Add(-gracePeriod))
@@ -266,7 +264,7 @@ func (s *Service) CleanupOrphans(ctx context.Context, gracePeriod time.Duration)
 		return removed, fmt.Errorf("remove orphan uploads: %w", err)
 	}
 	if removed > 0 {
-		s.logger.Warn().Ctx(ctx).Int("files", removed).Msg("orphan uploads removed")
+		s.logger.WarnContext(ctx, "orphan uploads removed", "files", removed)
 	}
 	return removed, nil
 }

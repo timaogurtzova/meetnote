@@ -77,6 +77,12 @@ func TestRepositoryFullScenarioAndUserIsolation(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE meetings SET file_size = -1 WHERE id = $1`, meeting.ID); err == nil {
 		t.Fatal("database accepted a negative file size")
 	}
+	var storedPaths []string
+	for storedPath, pathErr := range repository.ListStoredPaths(ctx) {
+		require.NoError(t, pathErr)
+		storedPaths = append(storedPaths, storedPath)
+	}
+	assert.Equal(t, []string{"/test/planning.txt"}, storedPaths)
 
 	if _, err := repository.GetMeeting(ctx, bob, meeting.ID); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("bob GetMeeting() error = %v, want not found", err)

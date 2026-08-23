@@ -4,11 +4,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"iter"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/timaogurtzova/meetnote/internal/app"
@@ -240,6 +241,19 @@ func TestServiceCleanupOrphansPassesReferencedPathsAndCutoff(t *testing.T) {
 	}
 }
 
+func TestServiceCleanupOrphansStopsWhenPathIterationFails(t *testing.T) {
+	t.Parallel()
+	wantErr := errors.New("database unavailable")
+	repository := &fakeRepository{storedPaths: []string{"/keep/a"}, storedPathsErr: wantErr}
+	files := &fakeFileStore{}
+	service := newTestService(t, repository, files, &fakeLLM{})
+
+	removed, err := service.CleanupOrphans(context.Background(), time.Hour)
+	assert.Zero(t, removed)
+	require.ErrorIs(t, err, wantErr)
+	assert.Nil(t, files.orphanKeep)
+}
+
 func TestServiceRejectsInvalidReadRetryAndCleanupInputsBeforeRepository(t *testing.T) {
 	t.Parallel()
 	repository := &fakeRepository{}
@@ -267,7 +281,7 @@ func newTestService(t *testing.T, repository app.Repository, files app.FileStore
 	service, err := app.NewService(repository, files, llm, app.Limits{
 		MaxQuestionRunes: 2000, MaxSearchQueryRunes: 500, MaxAnswerRunes: 8000, MaxChatHistory: 1000,
 		MeetingQuota: domain.MeetingQuota{MaxMeetings: 100, MaxPending: 10, MaxStorageBytes: 200 * 1024 * 1024},
-	}, zerolog.Nop())
+	}, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,8 +387,17 @@ func (f *fakeRepository) RetryMeeting(_ context.Context, userID, requestKey stri
 	return f.retryErr
 }
 
-func (f *fakeRepository) ListStoredPaths(context.Context) ([]string, error) {
-	return f.storedPaths, f.storedPathsErr
+func (f *fakeRepository) ListStoredPaths(context.Context) iter.Seq2[string, error] {
+	return func(yield func(string, error) bool) {
+		for _, path := range f.storedPaths {
+			if !yield(path, nil) {
+				return
+			}
+		}
+		if f.storedPathsErr != nil {
+			yield("", f.storedPathsErr)
+		}
+	}
 }
 
 type fakeFileStore struct {
