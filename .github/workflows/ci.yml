@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: meetnote_test
+          POSTGRES_USER: meetnote
+          POSTGRES_PASSWORD: meetnote
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U meetnote -d meetnote_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      TEST_DATABASE_URL: postgres://meetnote:meetnote@localhost:5432/meetnote_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.13"
+          cache: true
+      - run: go vet ./...
+      - run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+      - run: go test -race -count=1 ./...
